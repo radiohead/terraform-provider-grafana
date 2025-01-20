@@ -2,13 +2,13 @@ package resources
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/grafana/terraform-provider-grafana/appplatform/pkg/client"
 	"github.com/grafana/terraform-provider-grafana/appplatform/pkg/generated/resource/dashboard/v0alpha1"
+	"github.com/grafana/terraform-provider-grafana/appplatform/pkg/terraform"
 
 	"github.com/grafana/dashboard-linter/lint"
 	"github.com/grafana/grafana-app-sdk/k8s"
@@ -27,31 +27,11 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// DashboardModel represents a Grafana dashboard Terraform model.
-type DashboardModel struct {
-	UUID      types.String `tfsdk:"uuid"`
-	UID       types.String `tfsdk:"uid"`
-	Title     types.String `tfsdk:"title"`
-	FolderUID types.String `tfsdk:"folder_uid"`
-	URL       types.String `tfsdk:"url"`
-	Version   types.String `tfsdk:"version"`
-	Spec      types.String `tfsdk:"spec"`
-	Tags      types.List   `tfsdk:"tags"`
-	Options   types.Object `tfsdk:"options"`
-}
-
-// DashboardModelOptions represents the options for a Grafana dashboard Terraform model.
-type DashboardModelOptions struct {
-	Overwrite types.Bool `tfsdk:"overwrite"`
-	Validate  types.Bool `tfsdk:"validate"`
-	LintRules types.List `tfsdk:"lint_rules"`
-}
-
-// DashboardOptions represents the options for applying a Grafana dashboard.
-type DashboardOptions struct {
-	Overwrite bool
-	Validate  bool
-	LintRules []string
+// DashboardSpecModel represents the spec for a Grafana dashboard Terraform model.
+type DashboardSpecModel struct {
+	Title types.String `tfsdk:"title"`
+	Tags  types.List   `tfsdk:"tags"`
+	JSON  types.String `tfsdk:"json"`
 }
 
 // DashboardResource is a resource that manages Grafana dashboards.
@@ -73,56 +53,59 @@ func (r *DashboardResource) Schema(ctx context.Context, req resource.SchemaReque
 	* [Official documentation](https://grafana.com/docs/grafana/latest/dashboards/)
 	* [HTTP API](https://grafana.com/docs/grafana/latest/developers/http_api/dashboard/)
 	`,
-		Attributes: map[string]schema.Attribute{
-			// Required
-			"uid": schema.StringAttribute{
-				Required:    true,
-				Description: "The unique identifier of a dashboard, used to construct its URL. The uid allows having consistent URLs for accessing dashboards and when syncing dashboards between multiple Grafana installs.",
-			},
-			"title": schema.StringAttribute{
-				Required:    true,
-				Description: "The name of the dashboard, visible in the UI.",
-			},
-			"spec": schema.StringAttribute{
-				Required:    true,
-				Description: "The complete dashboard JSON.",
-				PlanModifiers: []planmodifier.String{
-					&DashboardNormalizer{},
-				},
-			},
-
-			// Optional
-			"folder_uid": schema.StringAttribute{
-				Optional:    true,
-				Description: "The UID of the folder to save the dashboard in.",
-			},
-			"tags": schema.ListAttribute{
-				Optional:    true,
-				ElementType: types.StringType,
-				Description: "A list of tags to attach to the dashboard. Tags can be used to filter dashboards in the Grafana UI.",
-			},
-
-			// Computed
-			"uuid": schema.StringAttribute{
-				Computed:    true,
-				Description: "The globally unique identifier of a dashboard, used by the API for tracking.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
-			},
-			"url": schema.StringAttribute{
-				Computed:    true,
-				Description: "The full URL of the dashboard.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
-			},
-			"version": schema.StringAttribute{
-				Computed:    true,
-				Description: "Whenever you save a version of your dashboard, a copy of that version is saved so that previous versions of your dashboard are not lost.",
-			},
-		},
 		Blocks: map[string]schema.Block{
+			"metadata": schema.SingleNestedBlock{
+				Description: "Metadata for the dashboard.",
+				Attributes: map[string]schema.Attribute{
+					"uid": schema.StringAttribute{
+						Description: "The unique identifier of a dashboard, used to construct its URL. The uid allows having consistent URLs for accessing dashboards and when syncing dashboards between multiple Grafana installs.",
+						Required:    true,
+					},
+					"folder_uid": schema.StringAttribute{
+						Description: "The UID of the folder to save the dashboard in.",
+						Optional:    true,
+					},
+					"uuid": schema.StringAttribute{
+						Description: "The globally unique identifier of a dashboard, used by the API for tracking.",
+						Computed:    true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"url": schema.StringAttribute{
+						Description: "The full URL of the dashboard.",
+						Computed:    true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"version": schema.StringAttribute{
+						Description: "Whenever you save a version of your dashboard, a copy of that version is saved so that previous versions of your dashboard are not lost.",
+						Computed:    true,
+					},
+				},
+			},
+			"spec": schema.SingleNestedBlock{
+				Description: "The complete dashboard JSON.",
+				Attributes: map[string]schema.Attribute{
+					"title": schema.StringAttribute{
+						Required:    true,
+						Description: "The name of the dashboard, visible in the UI.",
+					},
+					"tags": schema.ListAttribute{
+						Optional:    true,
+						ElementType: types.StringType,
+						Description: "A list of tags to attach to the dashboard. Tags can be used to filter dashboards in the Grafana UI.",
+					},
+					"json": schema.StringAttribute{
+						Required:    true,
+						Description: "The complete dashboard JSON.",
+						PlanModifiers: []planmodifier.String{
+							&DashboardNormalizer{},
+						},
+					},
+				},
+			},
 			"options": schema.SingleNestedBlock{
 				Description: "Options for applying the dashboard.",
 				Attributes: map[string]schema.Attribute{
@@ -188,19 +171,13 @@ func (r *DashboardResource) Configure(ctx context.Context, req resource.Configur
 
 // Create creates a new dashboard.
 func (r *DashboardResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var data DashboardModel
-	if diag := req.Plan.Get(ctx, &data); diag.HasError() {
+	dash, data, diag := terraform.ParseResource[DashboardSpecModel, *v0alpha1.Dashboard](ctx, req.Plan)
+	if diag.HasError() {
 		resp.Diagnostics.Append(diag...)
 		return
 	}
 
-	var dash v0alpha1.Dashboard
-	if diag := ParseDashboard(ctx, data, &dash); diag.HasError() {
-		resp.Diagnostics.Append(diag...)
-		return
-	}
-
-	res, err := r.client.Create(ctx, &dash, sdkresource.CreateOptions{})
+	res, err := r.client.Create(ctx, dash, sdkresource.CreateOptions{})
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to create dashboard", err.Error())
 		return
@@ -216,20 +193,8 @@ func (r *DashboardResource) Create(ctx context.Context, req resource.CreateReque
 
 // Update updates the dashboard.
 func (r *DashboardResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var data DashboardModel
-	if diag := req.Plan.Get(ctx, &data); diag.HasError() {
-		resp.Diagnostics.Append(diag...)
-		return
-	}
-
-	var opts DashboardOptions
-	if diag := ParseOptions(ctx, data.Options, &opts); diag.HasError() {
-		resp.Diagnostics.Append(diag...)
-		return
-	}
-
-	var dash v0alpha1.Dashboard
-	if diag := ParseDashboard(ctx, data, &dash); diag.HasError() {
+	dash, data, diag := terraform.ParseResource[DashboardSpecModel, *v0alpha1.Dashboard](ctx, req.Plan)
+	if diag.HasError() {
 		resp.Diagnostics.Append(diag...)
 		return
 	}
@@ -238,11 +203,11 @@ func (r *DashboardResource) Update(ctx context.Context, req resource.UpdateReque
 		ResourceVersion: dash.ResourceVersion,
 	}
 
-	if opts.Overwrite {
+	if data.Options.Overwrite.ValueBool() {
 		reqopts.ResourceVersion = ""
 	}
 
-	res, err := r.client.Update(ctx, &dash, reqopts)
+	res, err := r.client.Update(ctx, dash, reqopts)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to create dashboard", err.Error())
 		return
@@ -449,58 +414,6 @@ func (n *DashboardNormalizer) PlanModifyString(
 	ctx context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse,
 ) {
 	tflog.Debug(ctx, "normalizing dashboard plan")
-}
-
-// ParseDashboard parses a dashboard model into a dashboard resource.
-func ParseDashboard(ctx context.Context, src DashboardModel, dst *v0alpha1.Dashboard) diag.Diagnostics {
-	tflog.Debug(ctx, "parsing dashboard from model to resource")
-
-	res := make(diag.Diagnostics, 0)
-
-	meta, err := utils.MetaAccessor(dst)
-	if err != nil {
-		res.AddError("Failed to get request dashboard metadata", err.Error())
-		return res
-	}
-
-	// Set required attributes.
-	meta.SetName(src.UID.ValueString())
-
-	// Normally a resource would be constructed from the data model,
-	// but for the dashboard we expect the spec to be provided as a stringified JSON.
-	if err := json.Unmarshal([]byte(src.Spec.ValueString()), &dst.Spec.Object); err != nil {
-		res.AddError("Failed to parse dashboard spec", err.Error())
-		return res
-	}
-
-	if src.Title.ValueString() != "" {
-		dst.Spec.Object["title"] = src.Title.ValueString()
-	}
-
-	// Set optional overrides.
-	if fid := src.FolderUID.ValueString(); fid != "" {
-		meta.SetFolder(fid)
-	}
-
-	// Add extra tags, if set.
-	if len(src.Tags.Elements()) > 0 {
-		tags := make([]types.String, 0, len(src.Tags.Elements()))
-
-		if diag := src.Tags.ElementsAs(ctx, &tags, false); diag.HasError() {
-			return diag
-		}
-
-		// HACK: because the tags are not a known field in the dashboard spec,
-		// we need to manually wrangle them here.
-		dashtags := getTags(dst)
-		for _, tag := range tags {
-			dashtags = append(dashtags, tag.ValueString())
-		}
-
-		dst.Spec.Object["tags"] = dashtags
-	}
-
-	return res
 }
 
 func getTags(src *v0alpha1.Dashboard) []string {
