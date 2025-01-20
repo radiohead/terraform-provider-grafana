@@ -5,6 +5,7 @@ go 1.23.4
 toolchain go1.23.5
 
 require (
+	github.com/dave/dst v0.27.3
 	github.com/grafana/authlib/claims v0.0.0-20250120084028-e3328c576437
 	github.com/grafana/dashboard-linter v0.0.0-20241224134444-1765d94aec4a
 	github.com/grafana/grafana-app-sdk v0.30.0
